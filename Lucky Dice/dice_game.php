@@ -3,6 +3,11 @@ require_once("../include/bittorrent.php");
 dbconn();
 loggedinorreturn();
 
+// 初始化Session（确保在所有输出前调用）
+if (!isset($_SESSION)) {
+    session_start();
+}
+
 $user_id = $CURUSER['id'];
 $user = $CURUSER;
 
@@ -12,6 +17,31 @@ $error = '';
 $result = [];
 $magic_changed = false;
 $initial_magic = $user['seedbonus'];
+
+// 从Session获取结果并清除
+if (isset($_SESSION['dice_result'])) {
+    $result = $_SESSION['dice_result'];
+    unset($_SESSION['dice_result']);
+}
+
+if (isset($_SESSION['magic_changed'])) {
+    $magic_changed = $_SESSION['magic_changed'];
+    unset($_SESSION['magic_changed']);
+}
+
+if (isset($_SESSION['initial_magic'])) {
+    $initial_magic = $_SESSION['initial_magic'];
+    unset($_SESSION['initial_magic']);
+}
+
+if (isset($_SESSION['dice_error'])) {
+    $error = $_SESSION['dice_error'];
+    unset($_SESSION['dice_error']);
+}
+
+// 重新获取用户信息（可能已在Session中更新）
+$user_query = sql_query("SELECT * FROM users WHERE id = " . sqlesc($user_id));
+$user = mysqli_fetch_assoc($user_query);
 
 // 处理投注
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['bet_type']) && isset($_POST['bet_amount'])) {
@@ -83,10 +113,29 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['bet_type']) && isset(
                     'win' => $win,
                     'reward' => $reward
                 ];
+
+                // 存储结果到Session
+                $_SESSION['dice_result'] = $result;
+                $_SESSION['magic_changed'] = $magic_changed;
+                $_SESSION['initial_magic'] = $initial_magic;
+                
+                // 重定向以防止刷新重复提交
+                header('Location: ' . $_SERVER['PHP_SELF']);
+                exit;
             } catch (Exception $e) {
                 $error = "游戏过程中发生错误：" . $e->getMessage();
+                $_SESSION['dice_error'] = $error;
+                header('Location: ' . $_SERVER['PHP_SELF']);
+                exit;
             }
         }
+    }
+    
+    // 如果有错误，存储错误信息并重定向
+    if ($error) {
+        $_SESSION['dice_error'] = $error;
+        header('Location: ' . $_SERVER['PHP_SELF']);
+        exit;
     }
 }
 
