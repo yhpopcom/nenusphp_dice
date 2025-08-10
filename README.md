@@ -1,6 +1,6 @@
 # nenusphp_dice
 ### 一个骰子游戏适配 nexusphp (1.9.6测试无问题、出问题也别找我 ) 
-### 不对是两个！！ 
+### 不对是两个！！ [欢迎前往我的pt站](https://www.yhpp.cc)
 # 使用方式
 ### 把所选项目的所有文件放到public下、然后访问 localhost/dice_game.php 
 # 幸运骰子 Lucky Dice
