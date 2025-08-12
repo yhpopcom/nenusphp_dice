@@ -2,6 +2,7 @@
 require_once("../include/bittorrent.php");
 dbconn();
 loggedinorreturn();
+require_once('db_connect.php'); // 引入数据库连接工具类
 
 // 确保会话已启动
 if (session_status() == PHP_SESSION_NONE) {
@@ -14,18 +15,14 @@ $user = $CURUSER;
 // 加载配置
 $config = include('dice_config.php');
 
-// 连接数据库并确保表存在
+// 连接数据库（使用db_connect.php中的工具函数）
 try {
-    $db = new PDO('sqlite:' . $config['db_path']);
-    $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-    
-    // 自动创建必要的表
-    create_necessary_tables($db);
+    $db = connect_db($config['db_path']);
 } catch (PDOException $e) {
     die("数据库连接失败: " . $e->getMessage());
 }
 
-// 检查并处理开奖
+// 检查并处理开奖（包含补开昨日奖逻辑）
 check_and_process_draw($db, $config);
 
 $error = '';
@@ -99,32 +96,32 @@ if (isset($_SESSION['bet_success'])) {
 }
 
 // 获取今日投注
-    $stmt = $db->prepare("SELECT * FROM bets WHERE user_id = :user_id AND bet_date = :date ORDER BY created_at DESC");
-    $stmt->bindValue(':user_id', $user_id, PDO::PARAM_INT);
-    $stmt->bindValue(':date', $today);
-    $stmt->execute();
-    $today_bets = $stmt->fetchAll(PDO::FETCH_ASSOC);
+$stmt = $db->prepare("SELECT * FROM bets WHERE user_id = :user_id AND bet_date = :date ORDER BY created_at DESC");
+$stmt->bindValue(':user_id', $user_id, PDO::PARAM_INT);
+$stmt->bindValue(':date', $today);
+$stmt->execute();
+$today_bets = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-    // 关键修复：定义并初始化今日开奖结果变量
+// 定义并初始化今日开奖结果变量
+$today_result = null;
+try {
+    // 获取今日开奖结果（用于判断今日是否已开奖）
+    $stmt = $db->prepare("SELECT * FROM daily_results WHERE draw_date = :today");
+    $stmt->bindValue(':today', $today);
+    $stmt->execute();
+    $today_result = $stmt->fetch(PDO::FETCH_ASSOC);
+} catch (PDOException $e) {
+    // 处理查询错误
+    error_log("获取今日开奖结果失败: " . $e->getMessage());
     $today_result = null;
-    try {
-        // 获取今日开奖结果（用于判断今日是否已开奖）
-        $stmt = $db->prepare("SELECT * FROM daily_results WHERE draw_date = :today");
-        $stmt->bindValue(':today', $today);
-        $stmt->execute();
-        $today_result = $stmt->fetch(PDO::FETCH_ASSOC);
-    } catch (PDOException $e) {
-        // 处理查询错误
-        error_log("获取今日开奖结果失败: " . $e->getMessage());
-        $today_result = null;
-    }
+}
 
-    // 获取昨日开奖结果
-    $yesterday = date('Y-m-d', strtotime('-1 day'));
-    $stmt = $db->prepare("SELECT * FROM daily_results WHERE draw_date = :date");
-    $stmt->bindValue(':date', $yesterday);
-    $stmt->execute();
-    $yesterday_result = $stmt->fetch(PDO::FETCH_ASSOC);
+// 获取昨日开奖结果
+$yesterday = date('Y-m-d', strtotime('-1 day'));
+$stmt = $db->prepare("SELECT * FROM daily_results WHERE draw_date = :date");
+$stmt->bindValue(':date', $yesterday);
+$stmt->execute();
+$yesterday_result = $stmt->fetch(PDO::FETCH_ASSOC);
 
 // 获取昨日投注结果
 $stmt = $db->prepare("SELECT * FROM bets WHERE user_id = :user_id AND bet_date = :date ORDER BY created_at DESC");
@@ -144,15 +141,18 @@ $remaining_seconds = $draw_timestamp - $now_timestamp;
 $stmt = $db->query("SELECT * FROM daily_results ORDER BY draw_date DESC LIMIT 10");
 $historical_results = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-// 获取投注类型统计数据
-$stmt = $db->query("SELECT 
+// 获取当天投注类型统计数据（仅统计当天）
+$stmt = $db->prepare("SELECT 
     bet_type, 
     COUNT(DISTINCT user_id) as user_count, 
     SUM(bet_amount) as total_amount,
     COUNT(*) as bet_count
 FROM bets 
+WHERE bet_date = :today  -- 仅筛选当天的投注记录
 GROUP BY bet_type 
 ORDER BY total_amount DESC");
+$stmt->bindValue(':today', $today); // 绑定当天日期（$today已在代码中定义为当前日期）
+$stmt->execute();
 $bet_stats = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
 // 转换统计数据为关联数组
@@ -188,86 +188,100 @@ function calculate_percentage($value, $max_value) {
     return $max_value > 0 ? min(100, (int)(($value / $max_value) * 100)) : 0;
 }
 
-// 创建必要的数据表
-function create_necessary_tables($db) {
-    // 创建投注表
-    $db->exec("CREATE TABLE IF NOT EXISTS bets (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        bet_type TEXT NOT NULL,
-        bet_amount INTEGER NOT NULL,
-        bet_date DATE NOT NULL,
-        created_at DATETIME NOT NULL,
-        is_winner INTEGER DEFAULT 0,
-        reward INTEGER DEFAULT 0
-    )");
-    
-    // 创建每日结果表（解决当前错误的关键）
-    $db->exec("CREATE TABLE IF NOT EXISTS daily_results (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        draw_date DATE NOT NULL UNIQUE,
-        dice_result INTEGER NOT NULL,
-        drawn_at DATETIME NOT NULL
-    )");
-    
-    // 创建索引提升查询性能
-    $db->exec("CREATE INDEX IF NOT EXISTS idx_bets_user_date ON bets(user_id, bet_date)");
-    $db->exec("CREATE INDEX IF NOT EXISTS idx_bets_date ON bets(bet_date)");
-    $db->exec("CREATE INDEX IF NOT EXISTS idx_results_date ON daily_results(draw_date)");
-}
-
-// 开奖和结算处理函数
+// 开奖和结算处理函数（包含补开昨日奖逻辑）
 function check_and_process_draw($db, $config) {
     $today = date('Y-m-d');
+    $yesterday = date('Y-m-d', strtotime('-1 day')); // 昨日日期
     $current_time = date('H:i:s');
-    $draw_time = $config['draw_time'] . ':00'; // 补全秒数
-    
-    // 检查今日是否已开奖
+    $draw_time = $config['draw_time'] . ':00'; // 补全秒数（如23:59:00）
+
+    // 第一步：补开昨日的奖（若未开且已过昨日开奖时间）
+    $stmt = $db->prepare("SELECT * FROM daily_results WHERE draw_date = :yesterday");
+    $stmt->bindValue(':yesterday', $yesterday);
+    $stmt->execute();
+    $yesterday_has_drawn = $stmt->fetch(PDO::FETCH_ASSOC);
+
+    if (!$yesterday_has_drawn) {
+        // 计算昨日开奖时间的时间戳（如2024-05-20 23:59:00）
+        $yesterday_draw_timestamp = strtotime($yesterday . ' ' . $draw_time);
+        $now_timestamp = time();
+
+        // 若当前时间已过昨日开奖时间，补开昨日奖
+        if ($now_timestamp > $yesterday_draw_timestamp) {
+            $dice_result = rand(1, 6); // 生成昨日随机骰子结果
+
+            // 插入昨日开奖记录
+            $stmt = $db->prepare("INSERT INTO daily_results (draw_date, dice_result, drawn_at) 
+                                VALUES (:date, :result, datetime('now'))");
+            $stmt->bindValue(':date', $yesterday);
+            $stmt->bindValue(':result', $dice_result);
+            $stmt->execute();
+
+            // 处理昨日投注的中奖情况
+            $stmt = $db->prepare("SELECT * FROM bets WHERE bet_date = :yesterday");
+            $stmt->bindValue(':yesterday', $yesterday);
+            $stmt->execute();
+            $yesterday_bets = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+            foreach ($yesterday_bets as $bet) {
+                $bet_type = $bet['bet_type'];
+                $is_winner = false;
+
+                // 判断中奖逻辑
+                if (in_array($bet_type, ['big', 'small', 'odd', 'even'])) {
+                    $ranges = [
+                        'big' => [4,5,6],
+                        'small' => [1,2,3],
+                        'odd' => [1,3,5],
+                        'even' => [2,4,6]
+                    ];
+                    $is_winner = in_array($dice_result, $ranges[$bet_type] ?? []);
+                } else {
+                    $is_winner = ($dice_result == $bet_type);
+                }
+
+                // 计算奖励并更新投注记录
+                $odds = $config['bets'][$bet_type]['odds'] ?? 1;
+                $reward = $is_winner ? $bet['bet_amount'] * $odds : 0;
+                $stmt_update = $db->prepare("UPDATE bets SET is_winner = :is_winner, reward = :reward WHERE id = :bet_id");
+                $stmt_update->bindValue(':is_winner', $is_winner ? 1 : 0, PDO::PARAM_INT);
+                $stmt_update->bindValue(':reward', $reward, PDO::PARAM_INT);
+                $stmt_update->bindValue(':bet_id', $bet['id'], PDO::PARAM_INT);
+                $stmt_update->execute();
+
+                // 给中奖用户增加魔力值
+                if ($is_winner) {
+                    sql_query("UPDATE users SET seedbonus = seedbonus + $reward WHERE id = " . sqlesc($bet['user_id']));
+                }
+            }
+        }
+    }
+
+    // 第二步：处理今日的开奖
     $stmt = $db->prepare("SELECT * FROM daily_results WHERE draw_date = :today");
     $stmt->bindValue(':today', $today);
     $stmt->execute();
-    $has_drawn = $stmt->fetch(PDO::FETCH_ASSOC);
-    
-    // 如果未开奖，且当前时间已过开奖时间，则执行开奖
-    if (!$has_drawn && $current_time >= $draw_time) {
-        // 生成随机骰子结果（1-6）
+    $today_has_drawn = $stmt->fetch(PDO::FETCH_ASSOC);
+
+    if (!$today_has_drawn && $current_time >= $draw_time) {
         $dice_result = rand(1, 6);
-        
-        // 记录开奖结果到数据库
         $stmt = $db->prepare("INSERT INTO daily_results (draw_date, dice_result, drawn_at) 
                             VALUES (:date, :result, datetime('now'))");
         $stmt->bindValue(':date', $today);
         $stmt->bindValue(':result', $dice_result);
         $stmt->execute();
-        
-        // 获取今日所有投注
+
+        // 处理今日投注
         $stmt = $db->prepare("SELECT * FROM bets WHERE bet_date = :today");
         $stmt->bindValue(':today', $today);
         $stmt->execute();
         $today_bets = $stmt->fetchAll(PDO::FETCH_ASSOC);
-        
-        // 新增：获取今日开奖结果（用于判断今日是否已开奖）
-        $stmt = $db->prepare("SELECT * FROM daily_results WHERE draw_date = :today");
-        $stmt->bindValue(':today', $today);
-        $stmt->execute();
-        $today_result = $stmt->fetch(PDO::FETCH_ASSOC);
 
-    // 获取昨日开奖结果（保持不变）
-    $yesterday = date('Y-m-d', strtotime('-1 day'));
-    $stmt = $db->prepare("SELECT * FROM daily_results WHERE draw_date = :date");
-    $stmt->bindValue(':date', $yesterday);
-    $stmt->execute();
-    $yesterday_result = $stmt->fetch(PDO::FETCH_ASSOC);
-        
-        // 逐个处理投注，计算中奖情况
         foreach ($today_bets as $bet) {
             $bet_type = $bet['bet_type'];
             $is_winner = false;
             
-            // 判断是否中奖（支持大/小/单/双和具体点数）
             if (in_array($bet_type, ['big', 'small', 'odd', 'even'])) {
-                // 大/小/单/双类型判断
-                // 定义每种类型对应的数字范围
                 $ranges = [
                     'big' => [4,5,6],
                     'small' => [1,2,3],
@@ -276,23 +290,18 @@ function check_and_process_draw($db, $config) {
                 ];
                 $is_winner = in_array($dice_result, $ranges[$bet_type] ?? []);
             } else {
-                // 具体点数类型判断
                 $is_winner = ($dice_result == $bet_type);
             }
             
-            // 计算奖励（投注金额 × 赔率）
             $odds = $config['bets'][$bet_type]['odds'] ?? 1;
             $reward = $is_winner ? $bet['bet_amount'] * $odds : 0;
-            
-            // 更新投注记录
-            $stmt = $db->prepare("UPDATE bets SET is_winner = :is_winner, reward = :reward 
-                                WHERE id = :bet_id");
-            $stmt->bindValue(':is_winner', $is_winner ? 1 : 0, PDO::PARAM_INT);
-            $stmt->bindValue(':reward', $reward, PDO::PARAM_INT);
-            $stmt->bindValue(':bet_id', $bet['id'], PDO::PARAM_INT);
-            $stmt->execute();
-            
-            // 给中奖用户增加魔力值
+
+            $stmt_update = $db->prepare("UPDATE bets SET is_winner = :is_winner, reward = :reward WHERE id = :bet_id");
+            $stmt_update->bindValue(':is_winner', $is_winner ? 1 : 0, PDO::PARAM_INT);
+            $stmt_update->bindValue(':reward', $reward, PDO::PARAM_INT);
+            $stmt_update->bindValue(':bet_id', $bet['id'], PDO::PARAM_INT);
+            $stmt_update->execute();
+
             if ($is_winner) {
                 sql_query("UPDATE users SET seedbonus = seedbonus + $reward WHERE id = " . sqlesc($bet['user_id']));
             }
@@ -300,6 +309,7 @@ function check_and_process_draw($db, $config) {
     }
 }
 ?>
+
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -733,6 +743,7 @@ function check_and_process_draw($db, $config) {
                     btn.classList.remove('selected');
                 }
             });
+            
             updateSubmitButton();
             
             // 滚动到投注区域
@@ -831,15 +842,15 @@ function check_and_process_draw($db, $config) {
                             投注时间: <?php echo date('H:i:s', strtotime($bet['created_at'])); ?>
                         </div>
                         <div class="bet-result">
-                            <?php 
-                            // 现在$today_result已确保被定义，可以安全使用
-                            if ($today_result):
-                                // 已开奖：显示中奖结果
-                                echo $bet['is_winner'] ? '赢: ' . format_magic($bet['reward']) : '未中奖';
-                            else:
-                                // 未开奖：显示等待状态
-                                echo "等待开奖";
-                            endif;
+                            <?php
+                                // 现在$today_result已确保被定义，可以安全使用
+                                if ($today_result):
+                                    // 已开奖：显示中奖结果
+                                    echo $bet['is_winner'] ? '赢: ' . format_magic($bet['reward']) : '未中奖';
+                                else:
+                                    // 未开奖：显示等待状态
+                                    echo "等待开奖";
+                                endif;
                             ?>
                         </div>
                     </div>
@@ -906,7 +917,7 @@ function check_and_process_draw($db, $config) {
         <!-- 投注类型统计 -->
         <div class="card">
             <h2>投注类型统计</h2>
-            <p class="info-text">所有历史投注的统计数据，点击类型可直接选择投注</p>
+            <p class="info-text">每天的最新的统计数据，点击类型可直接选择投注</p>
             <div class="stats-container">
                 <?php foreach ($config['bets'] as $key => $bet): ?>
                     <?php 
